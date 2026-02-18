@@ -1,167 +1,95 @@
-import whisper
+# audio/voice_control.py
+
 import sounddevice as sd
 import numpy as np
-import scipy.io.wavfile as wav
-import pyautogui
-import os
-import threading
-import time
-
-# ================= AUTO MICROPHONE SELECTION =================
-def get_microphone():
-    devices = sd.query_devices()
-    for i, d in enumerate(devices):
-        if d["max_input_channels"] > 0 and "microphone" in d["name"].lower():
-            return i, d
-    raise RuntimeError("No microphone found")
-
-MIC_INDEX, MIC_INFO = get_microphone()
-SAMPLE_RATE = int(MIC_INFO["default_samplerate"])
-
-print(f"🎧 Using microphone [{MIC_INDEX}]: {MIC_INFO['name']}")
-print(f"🎚️ Sample rate: {SAMPLE_RATE}")
+import webrtcvad
+from faster_whisper import WhisperModel
+import queue
+import sys
 
 # ================= CONFIG =================
-MODEL_NAME = "small"
-DURATION = 3  # short window for responsiveness
+SAMPLE_RATE = 16000
+FRAME_DURATION_MS = 30
+FRAME_SIZE = int(SAMPLE_RATE * FRAME_DURATION_MS / 1000)
 
-# ================= LOAD WHISPER =================
-print("🔄 Loading Whisper model...")
-model = whisper.load_model(MODEL_NAME)
+MAX_VOICED_FRAMES = 50
+VAD_AGGRESSIVENESS = 1
 
-# ================= GLOBAL STATE =================
-MODE = "COMMAND"   # COMMAND | DICTATION
-move_x = 0
-move_y = 0
-running = True
+# ================= VAD =================
+vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
+audio_queue = queue.Queue()
 
-# ================= CURSOR MOVEMENT THREAD =================
-def cursor_loop():
-    global move_x, move_y, running
-    while running:
-        if MODE == "COMMAND" and (move_x != 0 or move_y != 0):
-            pyautogui.moveRel(move_x, move_y)
-        time.sleep(0.05)
+# ================= MODEL =================
+print("🔄 Loading faster-whisper (GPU)...")
+model = WhisperModel(
+    "tiny",
+    device="cuda",
+    compute_type="float16"
+)
+print("✅ Model loaded")
 
-threading.Thread(target=cursor_loop, daemon=True).start()
+# ================= AUDIO CALLBACK =================
+def audio_callback(indata, frames, time_info, status):
+    if status:
+        print(status, file=sys.stderr)
+    audio_queue.put(bytes(indata))
 
-# ================= LISTEN =================
-def listen(prompt):
-    print(f"\n🎙️ {prompt}")
+# ================= GENERATOR =================
+def listen():
+    """
+    Generator that yields transcribed text.
+    Owns microphone stream lifecycle.
+    """
 
-    audio = sd.rec(
-        int(DURATION * SAMPLE_RATE),
+    stream = sd.RawInputStream(
         samplerate=SAMPLE_RATE,
+        blocksize=FRAME_SIZE,
+        dtype="int16",
         channels=1,
-        dtype=np.float32,
-        device=MIC_INDEX
-    )
-    sd.wait()
-
-    if np.abs(audio).max() < 0.01:
-        return ""
-
-    wav.write("temp.wav", SAMPLE_RATE, audio)
-
-    result = model.transcribe(
-        "temp.wav",
-        language="en",
-        temperature=0.0,
-        condition_on_previous_text=False
+        callback=audio_callback
     )
 
-    text = result["text"].strip().lower()
-    print("📝 You said:", text)
-    return text
+    stream.start()
+    print("🎙️ Microphone stream started")
 
-# ================= COMMAND MODE =================
-def handle_command(text):
-    global MODE, move_x, move_y, running
+    try:
+        while True:
+            voiced_frames = []
+            speech_active = False
 
-    # MODE SWITCH
-    if "start typing" in text:
-        MODE = "DICTATION"
-        move_x = move_y = 0
-        print("⌨️ Dictation mode ENABLED")
-        return
+            while True:
+                frame = audio_queue.get()
 
-    # EXIT
-    if any(w in text for w in ["exit", "quit"]):
-        print("👋 Exiting NeuroGen Voice Control")
-        running = False
-        exit()
+                if vad.is_speech(frame, SAMPLE_RATE):
+                    speech_active = True
+                    voiced_frames.append(frame)
 
-    # CLICK
-    if any(w in text for w in ["click", "select", "press"]):
-        pyautogui.click()
-        print("🖱️ Clicked")
-        return
+                    if len(voiced_frames) >= MAX_VOICED_FRAMES:
+                        break
 
-    # OPEN APPS
-    if "open" in text or "launch" in text:
-        if "chrome" in text or "browser" in text:
-            os.system("start chrome")
-            print("🚀 Opened Chrome")
-            return
-        if "notepad" in text:
-            os.system("notepad")
-            print("📝 Opened Notepad")
-            return
+                elif speech_active:
+                    break
 
-    # SCROLL
-    if "scroll down" in text:
-        pyautogui.scroll(-400)
-        return
-    if "scroll up" in text:
-        pyautogui.scroll(400)
-        return
+            if not voiced_frames:
+                continue
 
-    # CURSOR MOVE
-    if "move" in text or "go" in text:
-        step = 10
-        if "slow" in text:
-            step = 5
-        elif "fast" in text:
-            step = 20
+            audio = (
+                np.frombuffer(b"".join(voiced_frames), dtype=np.int16)
+                .astype(np.float32) / 32768.0
+            )
 
-        if "left" in text:
-            move_x, move_y = -step, 0
-        elif "right" in text:
-            move_x, move_y = step, 0
-        elif "up" in text:
-            move_x, move_y = 0, -step
-        elif "down" in text:
-            move_x, move_y = 0, step
+            segments, _ = model.transcribe(
+                audio,
+                language="en",
+                temperature=0.0,
+                vad_filter=False
+            )
 
-        print("➡️ Cursor moving")
-        return
+            text = " ".join(seg.text for seg in segments).strip().lower()
+            if text:
+                yield text
 
-    # STOP CURSOR
-    if text.strip() == "stop":
-        move_x = move_y = 0
-        print("🛑 Cursor stopped")
-
-# ================= DICTATION MODE =================
-def handle_dictation(text):
-    global MODE
-
-    if "stop typing" in text:
-        MODE = "COMMAND"
-        print("🎙️ Command mode ENABLED")
-        return
-
-    # Type text
-    pyautogui.write(text + " ")
-    print("⌨️ Typed text")
-
-# ================= MAIN LOOP =================
-while True:
-    if MODE == "COMMAND":
-        spoken = listen("Speak a COMMAND (or say 'start typing')")
-        if spoken:
-            handle_command(spoken)
-
-    elif MODE == "DICTATION":
-        spoken = listen("Dictation mode (say 'stop typing')")
-        if spoken:
-            handle_dictation(spoken)
+    finally:
+        stream.stop()
+        stream.close()
+        print("🛑 Microphone stream stopped")

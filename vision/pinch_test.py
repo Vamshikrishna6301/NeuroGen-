@@ -3,6 +3,7 @@ import mediapipe as mp
 import math
 
 cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(
@@ -22,7 +23,6 @@ while True:
 
     frame = cv2.flip(frame, 1)
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
     result = hands.process(rgb)
 
     if result.multi_hand_landmarks:
@@ -34,43 +34,17 @@ while True:
 
         pinch_dist = distance(thumb, index)
 
-        # ALWAYS show distance
-        cv2.putText(
-            frame,
-            f"Pinch distance: {pinch_dist:.2f}",
-            (30, 60),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (0, 255, 0),
-            2
-        )
+        cv2.putText(frame, f"Pinch distance: {pinch_dist:.3f}",
+                    (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1,
+                    (0, 255, 0), 2)
 
-        # PINCH DETECTED
         if pinch_dist < 0.12:
-            cv2.putText(
-                frame,
-                "PINCH DETECTED",
-                (30, 120),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1.3,
-                (0, 0, 255),
-                3
-            )
-
-    else:
-        cv2.putText(
-            frame,
-            "NO HAND",
-            (30, 60),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (0, 0, 255),
-            2
-        )
+            cv2.putText(frame, "PINCH DETECTED",
+                        (30, 120), cv2.FONT_HERSHEY_SIMPLEX,
+                        1.3, (0, 0, 255), 3)
 
     cv2.imshow("Pinch Test", frame)
-
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    if cv2.waitKey(1) & 0xFF == ord("q"):
         break
 
 cap.release()
